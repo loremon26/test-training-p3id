@@ -1,131 +1,100 @@
-"""Run RelationFormer inference on one P&ID image."""
-
+"""Infer an entire P&ID through overlapping patches, or a single patch."""
+import argparse
 import json
-from argparse import ArgumentParser
 from pathlib import Path
-
-import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 import torch
-import yaml
-
-from inference import relation_infer
+from train import DEFAULT_CONFIG, dict2obj, load_config
 from models import build_model
+from inference import relation_infer, prediction_graph
+from pid_graph import patch_plan, save_graph_json, write_graph, overlay
+from scripts.merge_pid_graph import merge_graphs
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "road_2D.yaml"
-
-parser = ArgumentParser(description=__doc__)
-parser.add_argument("image", type=Path, help="PNG, JPEG, or other image to process")
-parser.add_argument("--checkpoint", type=Path, required=True, help="trained model checkpoint (.pt)")
-parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="model configuration file")
-parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "trained_weights" / "results" / "single_image")
-parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-parser.add_argument("--node-threshold", type=float, default=None)
-parser.add_argument("--edge-threshold", type=float, default=None)
-
-
-class ConfigObject:
-    def __init__(self, values):
-        self.__dict__.update(values)
-
-
-def load_config(path):
-    with path.open() as config_file:
-        return json.loads(json.dumps(yaml.safe_load(config_file)), object_hook=ConfigObject)
-
-
-def load_image(path, image_size):
-    with Image.open(path) as image:
-        original = image.convert("L")
-        original_size = original.size
-        resized = original.resize(tuple(image_size), Image.BILINEAR)
-        image_array = np.asarray(resized, dtype=np.float32) / 255.0
-    return torch.from_numpy(image_array)[None, None], original_size
-
-
-def save_visualization(image_path, nodes, edges, output_path):
-    with Image.open(image_path) as image:
-        image_array = np.asarray(image.convert("L"))
-    height, width = image_array.shape
-
-    figure, axis = plt.subplots(figsize=(12, 12), dpi=150)
-    axis.imshow(image_array, cmap="gray")
-    for first, second in edges:
-        axis.plot(
-            [nodes[first][0] * width, nodes[second][0] * width],
-            [nodes[first][1] * height, nodes[second][1] * height],
-            color="deepskyblue",
-            linewidth=1.2,
-        )
-    if nodes:
-        axis.scatter(
-            [node[0] * width for node in nodes],
-            [node[1] * height for node in nodes],
-            s=12,
-            c="crimson",
-        )
-    axis.axis("off")
-    figure.savefig(output_path, bbox_inches="tight", pad_inches=0)
-    plt.close(figure)
-
-
-def main(args):
-    if not args.image.is_file():
-        raise FileNotFoundError(f"Image not found: {args.image}")
-    if not args.checkpoint.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
-
-    config = load_config(args.config)
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
-    if args.device == "cuda" and device.type != "cuda":
-        print("CUDA is unavailable; running on CPU.")
-
-    model = build_model(config).to(device)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    model.load_state_dict(checkpoint["net"])
+def load_predictor(checkpoint_path, config_path=None, device='cuda'):
+    device=torch.device(device)
+    if device.type=='cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA unavailable; select --device cpu or enable a GPU')
+    checkpoint=torch.load(checkpoint_path,map_location='cpu',weights_only=False)
+    config=load_config(config_path) if config_path else (
+        dict2obj(checkpoint['config']) if 'config' in checkpoint else load_config(DEFAULT_CONFIG))
+    config.MODEL.ENCODER.PRETRAINED=False
+    model=build_model(config).to(device)
+    model.load_state_dict(checkpoint['net'],strict=True)
     model.eval()
-
-    image, original_size = load_image(args.image, config.DATA.IMG_SIZE)
-    node_threshold = args.node_threshold or config.INFERENCE.NODE_THRESHOLD
-    edge_threshold = args.edge_threshold or config.INFERENCE.EDGE_THRESHOLD
-    with torch.no_grad():
-        hidden, output = model(image.to(device))
-        predicted_nodes, predicted_edges = relation_infer(
-            hidden,
-            output,
-            model,
-            config.MODEL.DECODER.OBJ_TOKEN,
-            config.MODEL.DECODER.RLN_TOKEN,
-            nms=config.INFERENCE.NMS,
-            node_threshold=node_threshold,
-            edge_threshold=edge_threshold,
-        )
-
-    nodes = predicted_nodes[0].cpu().tolist()
-    edges = predicted_edges[0].tolist()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.image.stem
-    graph_path = args.output_dir / f"{stem}_graph.json"
-    preview_path = args.output_dir / f"{stem}_prediction.png"
-    with graph_path.open("w") as graph_file:
-        json.dump(
-            {
-                "image": str(args.image),
-                "original_size": {"width": original_size[0], "height": original_size[1]},
-                "nodes": nodes,
-                "edges": edges,
-            },
-            graph_file,
-            indent=2,
-        )
-    save_visualization(args.image, nodes, edges, preview_path)
-    print(f"Found {len(nodes)} nodes and {len(edges)} edges.")
-    print(f"Graph: {graph_path}")
-    print(f"Preview: {preview_path}")
+    return model,config,device
 
 
-if __name__ == "__main__":
-    main(parser.parse_args())
+@torch.no_grad()
+def predict_patches(model, config, paths, device, node_threshold=None, edge_threshold=None):
+    tensors,sizes=[],[]
+    for path in paths:
+        with Image.open(path) as image:
+            sizes.append(image.size)
+            array=np.array(image.convert('L').resize(tuple(config.DATA.IMG_SIZE),Image.Resampling.BILINEAR),dtype=np.float32)/255
+        tensors.append(torch.from_numpy(array)[None])
+    with torch.autocast(device.type,dtype=torch.float16,enabled=device.type=='cuda' and config.TRAIN.AMP):
+        h,out=model(torch.stack(tensors).to(device))
+    decoded=relation_infer(h,out,model,config.MODEL.DECODER.OBJ_TOKEN,config.MODEL.DECODER.RLN_TOKEN,
+            nms=config.INFERENCE.NMS,map_=True,
+            node_threshold=config.INFERENCE.NODE_THRESHOLD if node_threshold is None else node_threshold,
+            edge_threshold=config.INFERENCE.EDGE_THRESHOLD if edge_threshold is None else edge_threshold)
+    return [prediction_graph(decoded,i,size) for i,size in enumerate(sizes)]
+
+
+def predict_plan(model, config, image, output_dir, device, patch_size=1500, stride=750,
+                 resize=(7000,4500), batch_size=2, node_threshold=None, edge_threshold=None,
+                 merge_threshold=.15, nms_iou=.8, wbf_iou=.4, border_tolerance=8):
+    output_dir=Path(output_dir)
+    manifest=patch_plan(image,None,output_dir/'patches',patch_size,stride,resize)
+    predictions=[]
+    for start in range(0,len(manifest['patches']),batch_size):
+        group=manifest['patches'][start:start+batch_size]
+        graphs=predict_patches(model,config,[output_dir/'patches'/p['image'] for p in group],device,
+                              node_threshold,edge_threshold)
+        predictions.extend(graphs)
+        for patch,graph in zip(group,graphs):
+            save_graph_json(output_dir/'predictions'/f"{patch['id']}.json",graph['nodes'],graph['edges'])
+    nodes,edges=merge_graphs(manifest,predictions,merge_threshold,nms_iou,wbf_iou,border_tolerance)
+    save_graph_json(output_dir/'graph.json',nodes,edges,image=str(Path(image).resolve()),manifest='patches/manifest.json')
+    write_graph(output_dir/'graph.graphml',nodes,edges)
+    overlay(image,nodes,edges,output_dir/'prediction.png',confidence=True)
+    return dict(nodes=nodes,edges=edges)
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('image',type=Path)
+    p.add_argument('--checkpoint',type=Path,required=True)
+    p.add_argument('--config',type=Path)
+    p.add_argument('--output-dir',type=Path,required=True)
+    p.add_argument('--device',default='cuda')
+    p.add_argument('--single-patch',action='store_true')
+    p.add_argument('--patch-size',type=int,default=1500)
+    p.add_argument('--stride',type=int,default=750)
+    p.add_argument('--resize',nargs=2,type=int,default=[7000,4500],metavar=('WIDTH','HEIGHT'))
+    p.add_argument('--batch-size',type=int,default=2)
+    p.add_argument('--node-threshold',type=float)
+    p.add_argument('--edge-threshold',type=float)
+    p.add_argument('--merge-threshold',type=float,default=.15)
+    p.add_argument('--nms-iou',type=float,default=.8)
+    p.add_argument('--wbf-iou',type=float,default=.4)
+    p.add_argument('--border-tolerance',type=float,default=8)
+    a=p.parse_args()
+    if a.batch_size<1:
+        p.error('--batch-size must be positive')
+    model,config,device=load_predictor(a.checkpoint,a.config,a.device)
+    if a.single_patch:
+        graph=predict_patches(model,config,[a.image],device,a.node_threshold,a.edge_threshold)[0]
+        save_graph_json(a.output_dir/'graph.json',graph['nodes'],graph['edges'],image=str(a.image.resolve()))
+        write_graph(a.output_dir/'graph.graphml',graph['nodes'],graph['edges'])
+        overlay(a.image,graph['nodes'],graph['edges'],a.output_dir/'prediction.png',True)
+    else:
+        graph=predict_plan(model,config,a.image,a.output_dir,device,a.patch_size,a.stride,a.resize,a.batch_size,
+                           a.node_threshold,a.edge_threshold,a.merge_threshold,a.nms_iou,a.wbf_iou,a.border_tolerance)
+    print(f"{len(graph['nodes'])} nodes, {len(graph['edges'])} edges -> {a.output_dir}")
+
+
+if __name__=='__main__':
+    main()

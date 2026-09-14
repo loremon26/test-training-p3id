@@ -147,7 +147,7 @@ class SetCriterion(nn.Module):
             pred_nodes, target_nodes, reduction="none"
         )  # TODO: check detr for loss function
 
-        loss = loss.sum() / num_nodes
+        loss = loss.sum() / max(num_nodes, 1)
 
         return loss
 
@@ -168,7 +168,7 @@ class SetCriterion(nn.Module):
                 box_ops_2D.box_cxcywh_to_xyxy(target_boxes),
             )
         )
-        loss = loss.sum() / num_boxes
+        loss = loss.sum() / max(num_boxes, 1)
         return loss
 
     def loss_edges(self, h, target_nodes, target_edges, target_edge_classes, indices):
@@ -189,7 +189,7 @@ class SetCriterion(nn.Module):
             # remap GT node ids -> matched position, dropping edges touching unmatched nodes
             edges = edges.cpu()
             edge_classes = edge_classes.cpu()
-            remap = torch.full((int(edges.max()) + 1 if edges.numel() else 1,), -1, dtype=torch.long)
+            remap = torch.full((len(target_nodes[batch_id]),), -1, dtype=torch.long)
             remap[tgt_idx] = torch.arange(matched_node_count)
             pos_edge = remap[edges]
             valid_pos_mask = (pos_edge >= 0).all(1)
@@ -212,10 +212,11 @@ class SetCriterion(nn.Module):
                 neg_edges.shape[0],
                 max(self.neg_edge_ratio * pos_edge.shape[0], self.min_neg_edges),
             )
-            neg_edges = neg_edges[torch.randperm(neg_edges.shape[0])[:take_neg]]
+            order = torch.randperm(neg_edges.shape[0]) if self.training else torch.arange(neg_edges.shape[0])
+            neg_edges = neg_edges[order[:take_neg]]
 
             all_edges_ = torch.cat((pos_edge, neg_edges), 0)
-            if self.randomize_edge_directions:
+            if self.randomize_edge_directions and self.training:
                 flip = torch.rand(all_edges_.shape[0]) > 0.5
                 all_edges_[flip] = all_edges_[flip][:, [1, 0]]
             all_edges_ = all_edges_.to(h.device)
@@ -243,6 +244,8 @@ class SetCriterion(nn.Module):
         relation_feature = torch.cat(relation_feature, 0)
         edge_labels = torch.cat(edge_labels, 0).to(h.device)
         relation_pred = self.net.relation_embed(relation_feature)
+        if not edge_labels.numel():
+            return relation_pred.sum() * 0
         return F.cross_entropy(relation_pred, edge_labels, reduction="mean")
 
     def _get_src_permutation_idx(self, indices):
@@ -286,6 +289,7 @@ class SetCriterion(nn.Module):
         )
         target["node_classes"] = self._target_node_classes
         target["edge_classes"] = target_edge_classes
+        target["boxes"] = target_boxes
 
         indices = self.matcher(out, target)
 

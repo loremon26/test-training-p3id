@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import shutil
 import time
 from collections import Counter
@@ -160,8 +161,12 @@ def parse_graph(graph_path: Path) -> tuple[list[dict], list[dict]]:
     keys = _key_map(root)
 
     nodes = []
+    background_ids = set()
     for node in graph.findall(f"{NAMESPACE}node"):
         attributes = _attrs(node, keys)
+        if attributes.get("label", "").lower() == "background":
+            background_ids.add(node.get("id"))
+            continue
         xmin = attributes.get("xmin")
         ymin = attributes.get("ymin")
         xmax = attributes.get("xmax")
@@ -178,26 +183,50 @@ def parse_graph(graph_path: Path) -> tuple[list[dict], list[dict]]:
                 "ymin": float(ymin),
                 "xmax": float(xmax),
                 "ymax": float(ymax),
+                "score": float(attributes.get("confidence", 1.0)),
             }
         )
 
+    node_ids = {n["id"] for n in nodes}
+    if len(node_ids) != len(nodes) or None in node_ids:
+        raise ValueError(f"Missing or duplicate node IDs: {graph_path}")
+    for n in nodes:
+        if not all(math.isfinite(n[k]) for k in ("xmin", "ymin", "xmax", "ymax", "score")):
+            raise ValueError(f"Non-finite node data: {graph_path}")
+        if n["xmax"] <= n["xmin"] or n["ymax"] <= n["ymin"]:
+            raise ValueError(f"Degenerate box: {graph_path}, {n['id']}")
+        if not 0<=n['score']<=1:
+            raise ValueError(f'Invalid node confidence: {graph_path}')
     edges = []
+    seen = {}
     for edge in graph.findall(f"{NAMESPACE}edge"):
         attributes = _attrs(edge, keys)
         source = edge.get("source")
         target = edge.get("target")
         if source is None or target is None or source == target:
             continue
+        if source in background_ids or target in background_ids:
+            continue
+        if source not in node_ids or target not in node_ids:
+            raise ValueError(f"Dangling edge: {graph_path}, {source}, {target}")
+        label = _map_edge_label(attributes.get("edge_label", attributes.get("label")))
+        pair = tuple(sorted((source, target)))
+        if pair in seen:
+            if seen[pair] != label:
+                raise ValueError(f"Conflicting edge labels: {graph_path}, {pair}")
+            continue
+        seen[pair] = label
+        confidence=float(attributes.get('confidence',1.))
+        if not math.isfinite(confidence) or not 0<=confidence<=1:
+            raise ValueError(f'Invalid edge confidence: {graph_path}')
         edges.append(
             {
                 "source": source,
                 "target": target,
-                "label": _map_edge_label(attributes.get("edge_label")),
+                "label": label,
+                "score": confidence,
             }
         )
-
-    if not edges:
-        raise ValueError(f"Graph has no valid edges: {graph_path}")
 
     return nodes, edges
 
@@ -240,6 +269,9 @@ def write_graph(graph_path: Path, nodes: list[dict], edges: list[dict]) -> None:
     )
 
     graph_elem = ElementTree.SubElement(graphml, "graph", {"edgedefault": "undirected"})
+    for key_id, scope in (("nc", "node"), ("ec", "edge")):
+        graphml.insert(0, ElementTree.Element("key", {"id": key_id, "for": scope,
+                       "attr.name": "confidence", "attr.type": "double"}))
 
     for node in nodes:
         node_elem = ElementTree.SubElement(graph_elem, "node", {"id": node["id"]})
@@ -248,6 +280,7 @@ def write_graph(graph_path: Path, nodes: list[dict], edges: list[dict]) -> None:
         ElementTree.SubElement(node_elem, "data", {"key": "d2"}).text = f"{node['ymin']:.6f}"
         ElementTree.SubElement(node_elem, "data", {"key": "d3"}).text = f"{node['xmax']:.6f}"
         ElementTree.SubElement(node_elem, "data", {"key": "d4"}).text = f"{node['ymax']:.6f}"
+        ElementTree.SubElement(node_elem, "data", {"key": "nc"}).text = str(node.get("score", 1.0))
 
     for edge in edges:
         edge_elem = ElementTree.SubElement(
@@ -256,6 +289,7 @@ def write_graph(graph_path: Path, nodes: list[dict], edges: list[dict]) -> None:
             {"source": edge["source"], "target": edge["target"]},
         )
         ElementTree.SubElement(edge_elem, "data", {"key": "d5"}).text = edge["label"]
+        ElementTree.SubElement(edge_elem, "data", {"key": "ec"}).text = str(edge.get("score", 1.0))
 
     graph_path.parent.mkdir(parents=True, exist_ok=True)
     ElementTree.ElementTree(graphml).write(graph_path, encoding="utf-8", xml_declaration=True)

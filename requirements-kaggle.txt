@@ -1,10 +1,8 @@
-# Keep the torch/torchvision/CUDA versions preinstalled by Kaggle.
-monai>=1.3,<2.0
-pytorch-ignite>=0.5,<0.6
-tensorboardX>=2.6
-PyYAML>=6.0
-Pillow>=9.0
+# Keep Kaggle's preinstalled torch/torchvision/CUDA. Python >=3.10.
+# CairoSVG is needed only to extract the public SVG symbol library.
+numpy>=1.24
+Pillow>=10
+PyYAML>=6
 scipy>=1.10
 matplotlib>=3.7
-tqdm>=4.65
-tensorboard>=2.12
+CairoSVG>=2.7

@@ -13,64 +13,18 @@ import random
 import yaml
 import json
 import hashlib
+from collections import Counter
 from multiprocessing import Pool
 from pathlib import Path
 from xml.etree import ElementTree
 
 
-PID_NODE_CLASS_TO_ID = {
-    "general": 1,
-    "tank": 2,
-    "valve": 3,
-    "instrumentation": 4,
-    "pump": 5,
-    "inlet_outlet": 6,
-    "arrow": 7,
-    "crossing": 8,
-    "ankle": 9,
-    "border": 10,
-}
+from prepare_pid2graph_paper_dataset import (
+    PID_NODE_CLASS_TO_ID, PID_NODE_LABEL_ALIASES, PID_EDGE_CLASS_TO_ID,
+    PID_EDGE_LABEL_ALIASES, parse_graph,
+)
 
-PID_NODE_LABEL_ALIASES = {
-    "general": "general",
-    "tank": "tank",
-    "tank_vessel": "tank",
-    "tank/vessel": "tank",
-    "vessel": "tank",
-    "valve": "valve",
-    "instrumentation": "instrumentation",
-    "instrument": "instrumentation",
-    "pump": "pump",
-    "compressor": "pump",
-    "pump_compressor": "pump",
-    "pump/compressor": "pump",
-    "inlet_outlet": "inlet_outlet",
-    "inlet/outlet": "inlet_outlet",
-    "inlet": "inlet_outlet",
-    "outlet": "inlet_outlet",
-    "arrow": "arrow",
-    "crossing": "crossing",
-    "connector": "ankle",
-    "ankle": "ankle",
-    "border": "border",
-    "border_node": "border",
-}
-
-PID_EDGE_CLASS_TO_ID = {
-    "solid": 1,
-    "non_solid": 2,
-}
-
-PID_EDGE_LABEL_ALIASES = {
-    "solid": "solid",
-    "non_solid": "non_solid",
-    "non-solid": "non_solid",
-    "nonsolid": "non_solid",
-    "dashed": "non_solid",
-    "dash": "non_solid",
-}
-
-PID_CACHE_SCHEMA_VERSION = "v4"
+PID_CACHE_SCHEMA_VERSION = "v5"
 
 
 class ToulouseRoadNetworkDataset(Dataset):
@@ -142,6 +96,9 @@ class PatchedPIDDataset(Dataset):
         train_sources=None,
         test_sources=None,
         validation_percent=5,
+        source_limits=None,
+        augment=False,
+        cache_images=False,
     ):
         if split not in self.SPLITS:
             raise ValueError(f"Unsupported P&ID split: {split}")
@@ -160,19 +117,32 @@ class PatchedPIDDataset(Dataset):
             train_sources=train_sources,
             test_sources=test_sources,
             validation_percent=validation_percent,
+            source_limits=source_limits,
         )[split]
 
         if not samples:
             raise RuntimeError(f"No paired P&ID samples found for the {split} split under {root}")
 
         self.ids = [sample_id for _, _, sample_id in samples]
+        self.samples = samples
+        self.augment = augment and split == 'train'
+        self.epoch = 0
+        self.seed = split_seed
+        self.metadata = {}
+        for _, graph_path, _ in samples:
+            manifest_path = graph_path.parent / 'manifest.json'
+            if manifest_path.is_file() and str(graph_path.parent) not in self.metadata:
+                self.metadata[str(graph_path.parent)] = json.loads(manifest_path.read_text())
         cache_key = hashlib.sha1(
             f"{root.resolve()}:{split_seed}:{max_nodes}:{split}:{self.image_size}:"
             f"{train_sources}:{test_sources}:{validation_percent}:{PID_CACHE_SCHEMA_VERSION}".encode()
         ).hexdigest()[:16]
-        self.images, self.graphs = preprocess_pid_samples(
-            samples, self.image_size, cache_dir / f"pid_{cache_key}_{split}"
-        )
+        self.images, self.graphs = None, None
+        if cache_images:
+            digest = hashlib.sha1(str([(str(i),i.stat().st_mtime_ns,str(g),g.stat().st_mtime_ns) for i,g,_ in samples]).encode()).hexdigest()[:12]
+            self.images, self.graphs = preprocess_pid_samples(
+                samples, self.image_size, cache_dir / f"pid_{cache_key}_{digest}_{split}"
+            )
 
         print(f"Loaded {len(self.ids)} P&ID samples for {split}.")
 
@@ -180,8 +150,23 @@ class PatchedPIDDataset(Dataset):
         return len(self.ids)
 
     def __getitem__(self, idx):
-        image = torch.from_numpy(np.array(self.images[idx])).float().div_(255)
-        nodes, edges, node_classes, edge_classes, node_boxes = self.graphs[idx]
+        repeat = 0
+        if isinstance(idx, tuple):
+            idx, repeat = idx
+        if self.images is None:
+            image_path, graph_path, _ = self.samples[idx]
+            with Image.open(image_path) as source:
+                width,height = source.size
+                image = source.convert('L').resize(self.image_size, Image.Resampling.BILINEAR)
+            graph = load_pid_graph(graph_path,width,height)
+        else:
+            image = Image.fromarray(np.array(self.images[idx]))
+            graph = self.graphs[idx]
+        nodes, edges, node_classes, edge_classes, node_boxes = graph
+        if self.augment:
+            image, nodes, edges, node_classes, edge_classes, node_boxes = augment_pid_sample(
+                image, graph, random.Random(f'{self.seed}:{self.epoch}:{idx}:{repeat}'))
+        image = torch.from_numpy(np.array(image)).float().div_(255)
         return (
             image[None, None],
             nodes,
@@ -195,6 +180,42 @@ class PatchedPIDDataset(Dataset):
 
 def resolve_cache_dir(cache_dir=None):
     return Path(cache_dir) if cache_dir else Path.home() / ".cache" / "relationformer"
+
+
+def augment_pid_sample(image, graph, rng):
+    """Paired affine image/box/edge transform, with clipping and new border nodes."""
+    from PIL import ImageEnhance, ImageFilter
+    from pid_graph import transform_graph, crop_graph
+    width,height=image.size
+    nodes,edges,classes,edge_classes,boxes=graph
+    names={v:k for k,v in PID_NODE_CLASS_TO_ID.items()}
+    edge_names={v:k for k,v in PID_EDGE_CLASS_TO_ID.items()}
+    raw=[]
+    for i,(b,c) in enumerate(zip(boxes.tolist(),classes.tolist())):
+        x,y,w,h=b
+        raw.append(dict(id=str(i),label=names[c],xmin=(x-w/2)*width,ymin=(y-h/2)*height,
+                        xmax=(x+w/2)*width,ymax=(y+h/2)*height))
+    es=[dict(source=str(u),target=str(v),label=edge_names[c]) for (u,v),c in zip(edges.tolist(),edge_classes.tolist())]
+    angle=np.deg2rad(rng.choice([0,90,180,270])+rng.uniform(-4,4))
+    scale=rng.uniform(.9,1.1)
+    linear=scale*np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
+    linear=linear@np.diag([rng.choice([-1,1]),rng.choice([-1,1])])
+    origin=np.array([width/2,height/2])
+    matrix=np.column_stack((linear,origin-linear@origin))
+    inverse=np.linalg.inv(np.vstack((matrix,[0,0,1])))[:2]
+    image=image.transform(image.size,Image.Transform.AFFINE,inverse.ravel(),Image.Resampling.BILINEAR,fillcolor=255)
+    raw,es=transform_graph(raw,es,matrix)
+    raw,es=crop_graph(raw,es,[0,0,width,height],border_size=8*width/1500)
+    mapping={n['id']:i for i,n in enumerate(raw)}
+    bs=torch.tensor([[(n['xmin']+n['xmax'])/(2*width),(n['ymin']+n['ymax'])/(2*height),
+                      (n['xmax']-n['xmin'])/width,(n['ymax']-n['ymin'])/height] for n in raw],dtype=torch.float32).reshape(-1,4)
+    image=ImageEnhance.Brightness(image).enhance(rng.uniform(.9,1.1))
+    image=ImageEnhance.Contrast(image).enhance(rng.uniform(.9,1.1))
+    if rng.random()<.25:
+        image=image.filter(ImageFilter.GaussianBlur(rng.uniform(.1,.6)))
+    return (image,bs[:,:2],torch.tensor([(mapping[e['source']],mapping[e['target']]) for e in es],dtype=torch.long).reshape(-1,2),
+            torch.tensor([PID_NODE_CLASS_TO_ID[n['label']] for n in raw],dtype=torch.long),
+            torch.tensor([PID_EDGE_CLASS_TO_ID[e['label']] for e in es],dtype=torch.long),bs)
 
 
 _WORKER_IMAGES = None
@@ -280,12 +301,9 @@ def index_pid_samples(
     train_sources=None,
     test_sources=None,
     validation_percent=5,
+    source_limits=None,
 ):
-    """Scans the dataset once and returns {split: [(image, graph, id), ...]}.
-
-    Results are cached on disk keyed by the root path, seed and node limit,
-    so subsequent runs skip the expensive rglob + GraphML parsing.
-    """
+    """Validate pairs, cache an index and report, and split by source drawing."""
     root = Path(root)
     cache_dir = resolve_cache_dir(cache_dir)
     train_sources = set(train_sources or [])
@@ -295,9 +313,14 @@ def index_pid_samples(
         raise ValueError(f"P&ID sources cannot be both train and test: {overlap}")
     if not 0 < validation_percent < 100:
         raise ValueError("validation_percent must be between 1 and 99")
+    # Explicit source roots also support Kaggle's symlinked read-only datasets.
+    graph_paths = sorted(g for source in root.iterdir() if source.is_dir() for g in source.rglob('*.graphml'))
+    fingerprint = [(str(g.relative_to(root)),g.stat().st_size,g.stat().st_mtime_ns,
+                    g.with_suffix('.png').stat().st_mtime_ns if g.with_suffix('.png').is_file() else None)
+                   for g in graph_paths]
     cache_key = hashlib.sha1(
         f"{root.resolve()}:{split_seed}:{max_nodes}:{sorted(train_sources)}:"
-        f"{sorted(test_sources)}:{validation_percent}:{PID_CACHE_SCHEMA_VERSION}".encode()
+        f"{sorted(test_sources)}:{source_limits}:{fingerprint}:{validation_percent}:{PID_CACHE_SCHEMA_VERSION}".encode()
     ).hexdigest()[:16]
     cache_path = cache_dir / f"pid_index_{cache_key}.pickle"
 
@@ -312,53 +335,72 @@ def index_pid_samples(
 
     print(f"Indexing P&ID samples under {root} (first run, this can take a few minutes)...")
     start_time = time.time()
-    graph_paths = sorted(root.rglob("*.graphml"))
+    if root.name == 'Complete' or any('Complete' in g.relative_to(root).parts for g in graph_paths):
+        raise ValueError('Training requires a patch root, not Complete drawings')
+    groups = {}
+    for graph_path in graph_paths:
+        rel = graph_path.relative_to(root)
+        if len(rel.parts)<3:
+            raise ValueError(f'Expected Source/Drawing/patch.graphml: {rel}')
+        groups.setdefault(rel.parts[0],set()).add('/'.join(rel.parts[:2]))
+    group_split = {}
+    for source, drawings in groups.items():
+        ordered=sorted(drawings,key=lambda d: hashlib.sha1(f'{split_seed}:{d}'.encode()).hexdigest())
+        if source_limits and source in source_limits:
+            if len(ordered)<source_limits[source]:
+                raise ValueError(f'{source}: need {source_limits[source]} drawings, found {len(ordered)}')
+            ordered=ordered[:source_limits[source]]
+        if source in test_sources:
+            group_split.update({d:'test' for d in ordered})
+        elif not train_sources or source in train_sources:
+            if len(ordered)<2:
+                raise ValueError(f'{source}: at least two drawings required for disjoint train/validation')
+            count=max(1,round(len(ordered)*validation_percent/100))
+            group_split.update({d:('valid' if i<count else 'train') for i,d in enumerate(ordered)})
     print(f"Found {len(graph_paths)} GraphML files, filtering...")
 
     splits = {split: [] for split in PatchedPIDDataset.SPLITS}
-    skipped_graphs = 0
+    report = dict(node_classes=Counter(),edge_classes=Counter(),empty_graphs=0,edgeless_graphs=0,
+                  max_nodes=0,boxes_outside=0,drawings={s:len(v) for s,v in groups.items()})
     for index, graph_path in enumerate(graph_paths, 1):
         image_path = graph_path.with_suffix(".png")
         if not image_path.is_file():
-            continue
+            raise FileNotFoundError(f'Missing image paired with {graph_path}')
 
         relative_graph = graph_path.relative_to(root)
         source = relative_graph.parts[0]
-        if source in test_sources:
-            split = "test"
-        elif not train_sources or source in train_sources:
-            # Keep every patch from one source drawing in the same split.
-            drawing_key = "/".join(relative_graph.parts[:2])
-            split_value = int(
-                hashlib.sha1(f"{split_seed}:{drawing_key}".encode()).hexdigest(), 16
-            ) % 100
-            split = "valid" if split_value < validation_percent else "train"
-        else:
+        split = group_split.get('/'.join(relative_graph.parts[:2]))
+        if split is None:
             continue
 
-        if is_trainable_pid_graph(graph_path, max_nodes=max_nodes):
-            splits[split].append(
-                (
-                    image_path.relative_to(root).as_posix(),
-                    relative_graph.as_posix(),
-                    relative_graph.with_suffix("").as_posix(),
-                )
-            )
-        else:
-            skipped_graphs += 1
+        ns,es=parse_graph(graph_path)
+        if max_nodes is not None and len(ns)>max_nodes:
+            raise ValueError(f'{graph_path}: {len(ns)} nodes exceed {max_nodes} queries')
+        report['node_classes'].update(n['label'] for n in ns)
+        report['edge_classes'].update(e['label'] for e in es)
+        report['empty_graphs']+=not ns
+        report['edgeless_graphs']+=not es
+        report['max_nodes']=max(report['max_nodes'],len(ns))
+        with Image.open(image_path) as im:
+            width,height=im.size
+        report['boxes_outside']+=sum(n['xmin']<0 or n['ymin']<0 or n['xmax']>width or n['ymax']>height for n in ns)
+        splits[split].append((image_path.relative_to(root).as_posix(),
+                             relative_graph.as_posix(),relative_graph.with_suffix('').as_posix()))
 
         if index % 5000 == 0:
             print(f"  {index}/{len(graph_paths)} graphs processed ({time.time() - start_time:.0f}s)")
 
     print(
         f"Indexing done in {time.time() - start_time:.0f}s "
-        f"({skipped_graphs} unusable graphs skipped): "
         + ", ".join(f"{split}={len(samples)}" for split, samples in splits.items())
     )
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     with open(cache_path, "wb") as cache_file:
         pickle.dump(splits, cache_file)
+    report['splits']={split:len(samples) for split,samples in splits.items()}
+    cache_path.with_suffix('.json').write_text(json.dumps(report,indent=2))
+    print(f'Dataset statistics: {cache_path.with_suffix(".json")}')
 
     return {
         split: [(root / img, root / graph, sample_id) for img, graph, sample_id in samples]
@@ -366,156 +408,36 @@ def index_pid_samples(
     }
 
 
-def _normalize_label(label):
-    return label.strip().lower().replace(" ", "_")
-
-
-def _read_graphml_key_maps(root):
-    namespace = "{http://graphml.graphdrawing.org/xmlns}"
-    key_to_name = {}
-    key_to_scope = {}
-    for key in root.findall(f"{namespace}key"):
-        key_id = key.get("id")
-        if key_id is None:
-            continue
-        key_to_name[key_id] = key.get("attr.name")
-        key_to_scope[key_id] = key.get("for")
-    return key_to_name, key_to_scope
-
-
-def _read_element_attributes(element, key_to_name):
-    namespace = "{http://graphml.graphdrawing.org/xmlns}"
-    attributes = {}
-    for data in element.findall(f"{namespace}data"):
-        key_name = key_to_name.get(data.get("key"))
-        if key_name and data.text is not None and key_name not in attributes:
-            attributes[key_name] = data.text
-    return attributes
-
-
-def _map_node_class(raw_label, graph_path):
-    normalized = _normalize_label(raw_label)
-    canonical = PID_NODE_LABEL_ALIASES.get(normalized)
-    if canonical is None:
-        raise ValueError(f"Unsupported node class '{raw_label}' in {graph_path}")
-    return PID_NODE_CLASS_TO_ID[canonical]
-
-
-def _map_edge_class(raw_label, graph_path):
-    normalized = _normalize_label(raw_label)
-    canonical = PID_EDGE_LABEL_ALIASES.get(normalized)
-    if canonical is None:
-        raise ValueError(f"Unsupported edge class '{raw_label}' in {graph_path}")
-    return PID_EDGE_CLASS_TO_ID[canonical]
-
-
 def load_pid_graph(graph_path, width, height):
-    """Converts GraphML bounding boxes to normalized node centers and edge indices.
-
-    Nodes that take part in no edge are dropped, since only line connectivity is learned.
-    """
-    namespace = "{http://graphml.graphdrawing.org/xmlns}"
-    root = ElementTree.parse(graph_path).getroot()
-    graph = root.find(f"{namespace}graph")
-    key_to_name, _ = _read_graphml_key_maps(root)
-    node_centers = {}
-    node_boxes = {}
-    node_classes = {}
-    for node in graph.findall(f"{namespace}node"):
-        attributes = _read_element_attributes(node, key_to_name)
-        xmin = attributes.get("xmin")
-        ymin = attributes.get("ymin")
-        xmax = attributes.get("xmax")
-        ymax = attributes.get("ymax")
-        if None in (xmin, ymin, xmax, ymax):
-            raise ValueError(f"Node {node.get('id')} in {graph_path} has no bounding box")
-
-        label = attributes.get("label")
-        if label is None:
-            raise ValueError(f"Node {node.get('id')} in {graph_path} has no class label")
-
-        xmin, ymin, xmax, ymax = map(float, (xmin, ymin, xmax, ymax))
-        node_centers[node.get("id")] = (
-            (xmin + xmax) / (2 * width),
-            (ymin + ymax) / (2 * height),
-        )
-        node_boxes[node.get("id")] = (
-            (xmin + xmax) / (2 * width),
-            (ymin + ymax) / (2 * height),
-            max(xmax - xmin, 1.0) / width,
-            max(ymax - ymin, 1.0) / height,
-        )
-        node_classes[node.get("id")] = _map_node_class(label, graph_path)
-
-    edge_pairs = {}
-    for edge in graph.findall(f"{namespace}edge"):
-        source, target = edge.get("source"), edge.get("target")
-        if source in node_centers and target in node_centers and source != target:
-            edge_attributes = _read_element_attributes(edge, key_to_name)
-            edge_label = edge_attributes.get("edge_label", "solid")
-            edge_class = _map_edge_class(edge_label, graph_path)
-            edge_key = (source, target) if source < target else (target, source)
-            # Prefer non-solid when duplicate edges carry conflicting labels.
-            edge_pairs[edge_key] = max(edge_pairs.get(edge_key, 0), edge_class)
-
-    if not edge_pairs:
-        raise ValueError(f"Graph {graph_path} has no usable edges")
-
-    connected_ids = sorted({node_id for pair in edge_pairs for node_id in pair})
-    node_indices = {node_id: index for index, node_id in enumerate(connected_ids)}
-    nodes = torch.tensor([node_centers[node_id] for node_id in connected_ids], dtype=torch.float32)
-    node_class_tensor = torch.tensor(
-        [node_classes[node_id] for node_id in connected_ids], dtype=torch.long
+    """Read GraphML, clip boxes and retain isolated/edgeless targets."""
+    raw_nodes, raw_edges = parse_graph(Path(graph_path))
+    nodes, boxes, classes, mapping = [], [], [], {}
+    for n in raw_nodes:
+        x1, y1 = max(0., n["xmin"]), max(0., n["ymin"])
+        x2, y2 = min(float(width), n["xmax"]), min(float(height), n["ymax"])
+        if x2 <= x1 or y2 <= y1:
+            continue
+        mapping[n["id"]] = len(nodes)
+        center = ((x1+x2)/(2*width), (y1+y2)/(2*height))
+        nodes.append(center)
+        boxes.append((*center, (x2-x1)/width, (y2-y1)/height))
+        classes.append(PID_NODE_CLASS_TO_ID[n["label"]])
+    edges = [e for e in raw_edges if e["source"] in mapping and e["target"] in mapping]
+    return (
+        torch.tensor(nodes, dtype=torch.float32).reshape(-1, 2),
+        torch.tensor([(mapping[e["source"]], mapping[e["target"]]) for e in edges],
+                     dtype=torch.long).reshape(-1, 2),
+        torch.tensor(classes, dtype=torch.long),
+        torch.tensor([PID_EDGE_CLASS_TO_ID[e["label"]] for e in edges], dtype=torch.long),
+        torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4),
     )
-    node_box_tensor = torch.tensor(
-        [node_boxes[node_id] for node_id in connected_ids], dtype=torch.float32
-    )
-    sorted_edges = sorted(edge_pairs.items())
-    edges = torch.tensor(
-        [(node_indices[source], node_indices[target]) for (source, target), _ in sorted_edges],
-        dtype=torch.long,
-    )
-    edge_class_tensor = torch.tensor([edge_class for _, edge_class in sorted_edges], dtype=torch.long)
-    return nodes, edges, node_class_tensor, edge_class_tensor, node_box_tensor
 
 
 def is_trainable_pid_graph(graph_path, max_nodes=None):
-    namespace = "{http://graphml.graphdrawing.org/xmlns}"
-    root = ElementTree.parse(graph_path).getroot()
-    graph = root.find(f"{namespace}graph")
-    key_to_name, _ = _read_graphml_key_maps(root)
-    node_ids = set()
-    for node in graph.findall(f"{namespace}node"):
-        attributes = _read_element_attributes(node, key_to_name)
-        bounding_box = (
-            attributes.get("xmin"),
-            attributes.get("ymin"),
-            attributes.get("xmax"),
-            attributes.get("ymax"),
-        )
-        if None in bounding_box:
-            return False
-        if attributes.get("label") is None:
-            return False
-        if PID_NODE_LABEL_ALIASES.get(_normalize_label(attributes["label"])) is None:
-            return False
-        node_ids.add(node.get("id"))
-
-    if max_nodes is not None and len(node_ids) > max_nodes:
-        return False
-
-    for edge in graph.findall(f"{namespace}edge"):
-        if (
-            edge.get("source") in node_ids
-            and edge.get("target") in node_ids
-            and edge.get("source") != edge.get("target")
-        ):
-            edge_attributes = _read_element_attributes(edge, key_to_name)
-            edge_label = edge_attributes.get("edge_label", "solid")
-            if PID_EDGE_LABEL_ALIASES.get(_normalize_label(edge_label)) is None:
-                return False
-            return True
-    return False
+    nodes, _ = parse_graph(Path(graph_path))
+    if max_nodes is not None and len(nodes) > max_nodes:
+        raise ValueError(f"{graph_path}: {len(nodes)} nodes exceed {max_nodes} object queries")
+    return True
 
 
 def image_graph_collate_road_network(batch):
@@ -633,6 +555,9 @@ def build_road_network_data(config, mode="split"):
             "train_sources": getattr(config.DATA, "TRAIN_SOURCES", None),
             "test_sources": getattr(config.DATA, "TEST_SOURCES", None),
             "validation_percent": getattr(config.DATA, "VALIDATION_PERCENT", 5),
+            "source_limits": vars(config.DATA.SOURCE_LIMITS) if getattr(config.DATA, 'SOURCE_LIMITS', None) else None,
+            "augment": getattr(config.DATA, 'AUGMENT', False),
+            "cache_images": getattr(config.DATA, 'CACHE_IMAGES', False),
         }
         if mode == "split":
             return PatchedPIDDataset(split="train", **dataset_kwargs), PatchedPIDDataset(

@@ -29,7 +29,8 @@ class BBoxEvaluator:
         self,
         classes,
         iou_fn=box_iou_2d_np,
-        max_detections=100
+        max_detections=100,
+        iou_threshold=None,
     ):
         """
         Class for evaluate detection metrics
@@ -46,10 +47,10 @@ class BBoxEvaluator:
         self.metrics = [
             Metric(
                 classes=classes,
-                iou_list=np.arange(0.1, 1.0, 0.1),  # for individual APs
-                iou_range=(0.5, 0.95, 0.05), # for mAP - different from coco (0.5, 0.95, 0.05)
+                iou_list=np.arange(0.1, 1.0, 0.1) if iou_threshold is None else [iou_threshold],
+                iou_range=(0.5, 0.95, 0.05) if iou_threshold is None else (iou_threshold,iou_threshold,.05),
                 per_class=True,
-                max_detection=(100, ) # different from nndet (100, )
+                max_detection=(max_detections, )
             )
         ]
 
@@ -612,7 +613,8 @@ class Metric:
         if cls_idx is not None:
             prec = prec[..., cls_idx, :]
         prec = prec[..., max_det_idx]
-        return np.mean(prec)
+        valid = prec[prec > -1]
+        return np.mean(valid) if valid.size else -1.
 
     @staticmethod
     def select_ar(

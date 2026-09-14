@@ -1,158 +1,66 @@
+"""Relationformer decoding with bounded-memory pair scoring."""
 import torch
-import torch.nn.functional as F
 from torchvision.ops import batched_nms
-import itertools
+from box_ops_2D import box_cxcywh_to_xyxy
+from prepare_pid2graph_paper_dataset import PID_NODE_CLASS_TO_ID, PID_EDGE_CLASS_TO_ID
 
 
-def relation_infer(
-    h,
-    out,
-    model,
-    obj_token,
-    rln_token,
-    nms=False,
-    map_=False,
-    node_threshold=0.5,
-    edge_threshold=0.5,
-):
-    # all token except the last one is object token
-    object_token = h[..., :obj_token, :]
+@torch.no_grad()
+def relation_infer(h, out, model, obj_token, rln_token, nms=False, map_=False,
+                   node_threshold=.5, edge_threshold=.5):
+    object_token=h[..., :obj_token, :]
+    probs=out["pred_logits"].softmax(-1)
+    scores,classes=probs[...,1:].max(-1)
+    classes=classes+1
+    values=[[] for _ in range(7)]
+    for batch in range(h.shape[0]):
+        ids=torch.where((scores[batch]>=node_threshold) & (probs[batch].argmax(-1)!=0))[0]
+        if nms and len(ids):
+            keep=batched_nms(box_cxcywh_to_xyxy(out["pred_nodes"][batch,ids]),
+                             scores[batch,ids],classes[batch,ids],.9)
+            ids=ids[keep]
+        boxes=out["pred_nodes"][batch,ids].detach()
+        pairs=torch.triu_indices(len(ids),len(ids),offset=1,device=h.device).T
+        kept,edge_scores,edge_classes=[],[],[]
+        for chunk in pairs.split(2048):
+            if not len(chunk):
+                continue
+            a=object_token[batch,ids[chunk[:,0]]]
+            b=object_token[batch,ids[chunk[:,1]]]
+            forward,reverse=[a,b],[b,a]
+            if rln_token:
+                relation=h[batch,obj_token:obj_token+rln_token].expand(len(chunk),-1)
+                forward.append(relation)
+                reverse.append(relation)
+            logits=(model.relation_embed(torch.cat(forward,1))+
+                    model.relation_embed(torch.cat(reverse,1)))/2
+            edge_probs=logits.softmax(-1)
+            confidence,label=edge_probs[:,1:].max(-1)
+            valid=(confidence>=edge_threshold) & (edge_probs.argmax(-1)!=0)
+            kept.append(chunk[valid])
+            edge_scores.append(confidence[valid])
+            edge_classes.append(label[valid]+1)
+        es=torch.cat(kept) if kept else torch.empty((0,2),dtype=torch.long,device=h.device)
+        ec=torch.cat(edge_classes) if edge_classes else torch.empty(0,dtype=torch.long,device=h.device)
+        conf=torch.cat(edge_scores) if edge_scores else torch.empty(0,device=h.device)
+        values[0].append(boxes[:,:2])
+        for bucket,value in zip(values[1:],(es,boxes,scores[batch,ids],classes[batch,ids],conf,ec)):
+            bucket.append(value.cpu().numpy())
+    return tuple(values) if map_ else tuple(values[:2])
 
-    # last token is relation token
-    if rln_token > 0:
-        relation_token = h[..., obj_token : obj_token + rln_token, :]
 
-    # Keep nodes only when the best non-background class clears the threshold.
-    node_probs = out["pred_logits"].softmax(-1).detach()
-    node_scores, node_classes = node_probs[..., 1:].max(-1)
-    node_classes = node_classes + 1
-    valid_token = node_scores >= node_threshold
-
-    # apply nms on valid tokens
-    if nms:
-        valid_token_nms = torch.zeros_like(valid_token)
-        for idx, (token, logits, nodes) in enumerate(
-            zip(valid_token, out["pred_logits"], out["pred_nodes"])
-        ):
-            valid_token_id = torch.nonzero(token).squeeze(1)
-
-            valid_logits, valid_nodes = logits[valid_token_id], nodes[valid_token_id]
-            valid_scores = F.softmax(valid_logits, dim=1)[:, 1:].max(-1).values
-
-            # 0 <= x1 < x2 and 0 <= y1 < y2 has to be fulfilled
-            valid_nodes[:, 2:] = valid_nodes[:, :2] + 0.5
-
-            ids2keep = batched_nms(
-                boxes=valid_nodes * 1000,
-                scores=valid_scores,
-                idxs=torch.ones_like(valid_scores, dtype=torch.long),
-                iou_threshold=0.90,
-            )
-            valid_token_id_nms = valid_token_id[ids2keep].sort()[0]
-            # print(valid_nodes.shape[0] - ids2keep.shape[0])
-
-            valid_token_nms[idx][valid_token_id_nms] = 1
-        valid_token = valid_token_nms
-
-    pred_nodes = []
-    pred_edges = []
-    if map_:
-        pred_nodes_boxes = []
-        pred_nodes_boxes_score = []
-        pred_nodes_boxes_class = []
-
-        pred_edges_boxes_score = []
-        pred_edges_boxes_class = []
-
-    for batch_id in range(h.shape[0]):
-
-        # ID of the valid tokens
-        node_id = torch.nonzero(valid_token[batch_id]).squeeze(1)
-
-        # coordinates of the valid tokens
-        pred_nodes.append(out["pred_nodes"][batch_id, node_id, :2].detach())
-
-        if map_:
-            pred_nodes_boxes.append(out["pred_nodes"][batch_id, node_id, :].detach().cpu().numpy())
-            pred_nodes_boxes_score.append(
-                node_scores[batch_id, node_id].detach().cpu().numpy()
-            )
-            pred_nodes_boxes_class.append(node_classes[batch_id, node_id].long().cpu().numpy())
-
-        if node_id.dim() != 0 and node_id.nelement() != 0 and node_id.shape[0] > 1:
-
-            # all possible node pairs in all token ordering
-            node_pairs = [list(i) for i in list(itertools.combinations(list(node_id), 2))]
-            node_pairs = list(map(list, zip(*node_pairs)))
-
-            # node pairs in valid token order
-            node_pairs_valid = torch.tensor(
-                [list(i) for i in list(itertools.combinations(list(range(len(node_id))), 2))]
-            )
-
-            # concatenate valid object pairs relation feature
-            if rln_token > 0:
-                relation_feature1 = torch.cat(
-                    (
-                        object_token[batch_id, node_pairs[0], :],
-                        object_token[batch_id, node_pairs[1], :],
-                        relation_token[batch_id, ...].repeat(len(node_pairs_valid), 1),
-                    ),
-                    1,
-                )
-                relation_feature2 = torch.cat(
-                    (
-                        object_token[batch_id, node_pairs[1], :],
-                        object_token[batch_id, node_pairs[0], :],
-                        relation_token[batch_id, ...].repeat(len(node_pairs_valid), 1),
-                    ),
-                    1,
-                )
-            else:
-                relation_feature1 = torch.cat(
-                    (
-                        object_token[batch_id, node_pairs[0], :],
-                        object_token[batch_id, node_pairs[1], :],
-                    ),
-                    1,
-                )
-                relation_feature2 = torch.cat(
-                    (
-                        object_token[batch_id, node_pairs[1], :],
-                        object_token[batch_id, node_pairs[0], :],
-                    ),
-                    1,
-                )
-
-            relation_pred1 = model.relation_embed(relation_feature1).detach()
-            relation_pred2 = model.relation_embed(relation_feature2).detach()
-            relation_pred = (relation_pred1 + relation_pred2) / 2.0
-
-            relation_probs = relation_pred.softmax(-1)
-            edge_scores, edge_classes = relation_probs[:, 1:].max(-1)
-            edge_classes = edge_classes + 1
-            pred_rel = torch.nonzero(edge_scores >= edge_threshold).squeeze(1).cpu().numpy()
-            pred_edges.append(node_pairs_valid[pred_rel].cpu().numpy())
-
-            if map_:
-                pred_edges_boxes_score.append(edge_scores[pred_rel].cpu().numpy())
-                pred_edges_boxes_class.append(edge_classes[pred_rel].long().cpu().numpy())
-        else:
-            pred_edges.append(torch.empty(0, 2))
-
-            if map_:
-                pred_edges_boxes_score.append(torch.empty(0, 1))
-                pred_edges_boxes_class.append(torch.empty(0, 1))
-
-    if map_:
-        return (
-            pred_nodes,
-            pred_edges,
-            pred_nodes_boxes,
-            pred_nodes_boxes_score,
-            pred_nodes_boxes_class,
-            pred_edges_boxes_score,
-            pred_edges_boxes_class,
-        )
-    else:
-        return pred_nodes, pred_edges
+def prediction_graph(decoded, index, size):
+    """Convert normalized cxcywh model outputs to canonical patch-pixel graphs."""
+    width,height=size
+    boxes,scores,classes=decoded[2][index],decoded[3][index],decoded[4][index]
+    node_names={v:k for k,v in PID_NODE_CLASS_TO_ID.items()}
+    edge_names={v:k for k,v in PID_EDGE_CLASS_TO_ID.items()}
+    nodes=[]
+    for i,(b,score,cls) in enumerate(zip(boxes,scores,classes)):
+        x,y,w,h=map(float,b)
+        nodes.append(dict(id=str(i),label=node_names[int(cls)],score=float(score),
+                          xmin=(x-w/2)*width,ymin=(y-h/2)*height,
+                          xmax=(x+w/2)*width,ymax=(y+h/2)*height))
+    edges=[dict(source=str(int(e[0])),target=str(int(e[1])),label=edge_names[int(c)],score=float(s))
+           for e,s,c in zip(decoded[1][index],decoded[5][index],decoded[6][index])]
+    return dict(schema_version=1,coordinate_space="pixels",nodes=nodes,edges=edges)

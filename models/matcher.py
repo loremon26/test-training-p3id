@@ -5,6 +5,7 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
+from box_ops_2D import box_cxcywh_to_xyxy, generalized_box_iou
 
 
 class HungarianMatcher(nn.Module):
@@ -26,6 +27,7 @@ class HungarianMatcher(nn.Module):
         super().__init__()
         self.cost_nodes = config.MODEL.MATCHER.C_NODE
         self.cost_class = config.MODEL.MATCHER.C_CLASS
+        self.cost_box = getattr(config.MODEL.MATCHER, 'C_BOX', 2)
 
     @torch.no_grad()
     def forward(self, outputs, targets):
@@ -56,6 +58,12 @@ class HungarianMatcher(nn.Module):
 
         # Final cost matrix
         C = self.cost_nodes * cost_nodes + self.cost_class * cost_class
+        if 'boxes' in targets:
+            predicted_boxes = outputs['pred_nodes'].flatten(0, 1)
+            target_boxes = torch.cat(targets['boxes'])
+            C += self.cost_box * (torch.cdist(predicted_boxes, target_boxes, p=1)
+                 - generalized_box_iou(box_cxcywh_to_xyxy(predicted_boxes),
+                                       box_cxcywh_to_xyxy(target_boxes)))
         C = C.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v) for v in targets['nodes']]

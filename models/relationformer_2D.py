@@ -107,31 +107,34 @@ class RelationFormer(nn.Module):
             ]
         )
 
-        # Deformable Transformer backbone
-        features, pos = self.encoder(samples)
+        # FrozenBatchNorm with random/offline initialization can overflow fp16
+        # deep in ResNet-101. Normalize projected features in fp32 before AMP.
+        with torch.autocast(samples.tensors.device.type, enabled=False):
+            # Deformable Transformer backbone
+            features, pos = self.encoder(samples)
 
-        # Create
-        srcs = []
-        masks = []
-        for l, feat in enumerate(features):
-            src, mask = feat.decompose()
-            srcs.append(self.input_proj[l](src))
-            masks.append(mask)
-            assert mask is not None
-
-        if self.num_feature_levels > len(srcs):
-            _len_srcs = len(srcs)
-            for l in range(_len_srcs, self.num_feature_levels):
-                if l == _len_srcs:
-                    src = self.input_proj[l](features[-1].tensors)
-                else:
-                    src = self.input_proj[l](srcs[-1])
-                m = samples.mask
-                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
-                pos_l = self.encoder[1](NestedTensor(src, mask)).to(src.dtype)
-                srcs.append(src)
+            # Create
+            srcs = []
+            masks = []
+            for l, feat in enumerate(features):
+                src, mask = feat.decompose()
+                srcs.append(self.input_proj[l](src))
                 masks.append(mask)
-                pos.append(pos_l)
+                assert mask is not None
+
+            if self.num_feature_levels > len(srcs):
+                _len_srcs = len(srcs)
+                for l in range(_len_srcs, self.num_feature_levels):
+                    if l == _len_srcs:
+                        src = self.input_proj[l](features[-1].tensors)
+                    else:
+                        src = self.input_proj[l](srcs[-1])
+                    m = samples.mask
+                    mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                    pos_l = self.encoder[1](NestedTensor(src, mask)).to(src.dtype)
+                    srcs.append(src)
+                    masks.append(mask)
+                    pos.append(pos_l)
 
         query_embeds = None
         if not self.two_stage:
