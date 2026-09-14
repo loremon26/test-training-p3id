@@ -52,7 +52,8 @@ def run_training(config,args,config_dict):
     torch.manual_seed(seed)
     if device.type=='cuda':
         torch.cuda.manual_seed_all(seed)
-        print(f'GPU: {torch.cuda.get_device_name(device)}, free/total bytes: {torch.cuda.mem_get_info(device)}',flush=True)
+        names=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+        print(f'GPUs: {names}, free/total bytes: {torch.cuda.mem_get_info(device)}',flush=True)
     batch_size=config.DATA.BATCH_SIZE
     effective=config.TRAIN.EFFECTIVE_BATCH_SIZE
     if batch_size<1 or effective<batch_size or effective%batch_size:
@@ -80,6 +81,11 @@ def run_training(config,args,config_dict):
     split_manifest=dict(train=train_ds.ids,validation=val_ds.ids,drawings=sorted(drawings),
                         data_signature=signature,real_weight=config.TRAIN.REAL_WEIGHT)
     model=build_model(config).to(device)
+    # DataParallel keeps checkpoints in the unwrapped format and gathers outputs
+    # on the primary GPU, where the variable-size graph loss is evaluated.
+    forward_model=torch.nn.DataParallel(model) if device.type=='cuda' and torch.cuda.device_count()>1 else model
+    if forward_model is not model:
+        print(f'Using {torch.cuda.device_count()} GPUs via DataParallel',flush=True)
     criterion=SetCriterion(config,build_matcher(config),model).to(device)
     optimizer=torch.optim.AdamW([
         {'params':[p for n,p in model.named_parameters() if p.requires_grad and not n.startswith('encoder.0.')],
@@ -143,7 +149,7 @@ def run_training(config,args,config_dict):
         for batch in loader:
             images=batch[0].to(device)
             with torch.autocast(device.type,dtype=torch.float16,enabled=amp):
-                h,out=model(images)
+                h,out=forward_model(images)
                 losses=criterion(h,out,batch_target(batch,device))
             if not torch.isfinite(losses['total']):
                 raise FloatingPointError(f'Non-finite loss at epoch {state["epoch"]}, cursor {state["cursor"]}')
@@ -176,7 +182,7 @@ def run_training(config,args,config_dict):
                     return
         val_loader=DataLoader(val_ds,batch_size=batch_size,num_workers=config.DATA.NUM_WORKERS,
             collate_fn=image_graph_collate_road_network,generator=torch.Generator().manual_seed(seed))
-        validation=evaluate(model,criterion,val_loader,config,device,
+        validation=evaluate(forward_model,criterion,val_loader,config,device,
                             output/'validation'/f'epoch_{state["epoch"]+1:03d}',amp)
         current=validation['loss']['total']
         improved=current < state['best']-config.TRAIN.EARLY_STOPPING_MIN_DELTA

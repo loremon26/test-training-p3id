@@ -1,4 +1,4 @@
-"""Two-stage P&ID Relationformer training entry point (single GPU, gradient accumulation)."""
+"""Two-stage P&ID Relationformer training entry point (DataParallel, gradient accumulation)."""
 import argparse
 import json
 import os
@@ -40,9 +40,9 @@ def main():
     p.add_argument('--synthetic-source',default='Dataset PID',
                    help='Patched source used as synthetic data (default: Dataset PID; use Generated for the local generator)')
     a=p.parse_args()
-    if len(a.cuda_visible_device)!=1:
-        p.error('This pipeline uses one GPU; use gradient accumulation for effective batch 20')
-    os.environ['CUDA_VISIBLE_DEVICES']=str(a.cuda_visible_device[0])
+    if not a.cuda_visible_device:
+        p.error('Select at least one CUDA device')
+    os.environ['CUDA_VISIBLE_DEVICES']=','.join(str(i) for i in a.cuda_visible_device)
     data=yaml.safe_load(a.config.read_text())
     data['TRAIN']['PHASE']=a.phase
     if a.data_root:

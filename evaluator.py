@@ -40,7 +40,8 @@ def evaluate(model,criterion,loader,config,device,preview_dir=None,amp=False):
             raise FloatingPointError('Non-finite validation loss')
         for key,value in losses.items():
             sums[key]=sums.get(key,0.)+float(value)*len(images)
-        decoded=relation_infer(h,out,model,config.MODEL.DECODER.OBJ_TOKEN,config.MODEL.DECODER.RLN_TOKEN,
+        relation_model=getattr(model,'module',model)
+        decoded=relation_infer(h,out,relation_model,config.MODEL.DECODER.OBJ_TOKEN,config.MODEL.DECODER.RLN_TOKEN,
                 map_=True,node_threshold=config.INFERENCE.METRIC_NODE_THRESHOLD,
                 edge_threshold=config.INFERENCE.METRIC_EDGE_THRESHOLD)
         size=(images.shape[-1],images.shape[-2])
